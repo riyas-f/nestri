@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser player</title>
+<!--
+  A bare player for neshub's WebRTC output: the picture, the sound, the
+  cursor, and keyboard and mouse back. It is a test page, not the product's
+  player -- everything is in this one file so the hub can serve it as it is.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd;
+               font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  video, canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  video { object-fit: contain; background: #000; }
+  canvas { pointer-events: none; }
+  #hud { position: fixed; top: 8px; left: 8px; padding: 6px 8px; border-radius: 6px;
+         background: rgba(0,0,0,.6); white-space: pre; font: 12px/1.35 ui-monospace, monospace; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; cursor: pointer;
+           background: rgba(0,0,0,.55); font-size: 18px; text-align: center; }
+  #start small { display: block; margin-top: 6px; font-size: 13px; color: #aaa; }
+  #full { position: fixed; top: 8px; right: 8px; padding: 6px 10px; border-radius: 6px;
+          border: 1px solid #555; background: rgba(0,0,0,.6); color: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="cursor"></canvas>
+</div>
+<div id="hud">connecting…</div>
+<button id="full" type="button">Fullscreen</button>
+<div id="start"><div>Click to play<small>Your mouse and keyboard go to the game. Press Esc to get them back.</small></div></div>
+<script>
+'use strict';
+
+const params = new URLSearchParams(location.search);
+const token = params.get('token') || '';
+const video = document.getElementById('video');
+const hud = document.getElementById('hud');
+const start = document.getElementById('start');
+const canvas = document.getElementById('cursor');
+const ctx = canvas.getContext('2d');
+
+// Input event types, as nesprotocol::input defines them.
+const INPUT_KEY = 0, INPUT_MOUSE_MOVE = 1, INPUT_MOUSE_BUTTON = 2, INPUT_MOUSE_WHEEL = 3;
+const CURSOR_UPDATE = 0x80, CURSOR_IMAGE = 0x81, CURSOR_HIDDEN = 0;
+
+// KeyboardEvent.code to the Linux keycode the box's compositor takes.
+const KEYCODES = {
+  Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8,
+  Digit8: 9, Digit9: 10, Digit0: 11, Minus: 12, Equal: 13, Backspace: 14, Tab: 15,
+  KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyU: 22, KeyI: 23, KeyO: 24,
+  KeyP: 25, BracketLeft: 26, BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30,
+  KeyS: 31, KeyD: 32, KeyF: 33, KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38,
+  Semicolon: 39, Quote: 40, Backquote: 41, ShiftLeft: 42, Backslash: 43, KeyZ: 44,
+  KeyX: 45, KeyC: 46, KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50, Comma: 51, Period: 52,
+  Slash: 53, ShiftRight: 54, NumpadMultiply: 55, AltLeft: 56, Space: 57, CapsLock: 58,
+  F1: 59, F2: 60, F3: 61, F4: 62, F5: 63, F6: 64, F7: 65, F8: 66, F9: 67, F10: 68,
+  NumLock: 69, ScrollLock: 70, Numpad7: 71, Numpad8: 72, Numpad9: 73, NumpadSubtract: 74,
+  Numpad4: 75, Numpad5: 76, Numpad6: 77, NumpadAdd: 78, Numpad1: 79, Numpad2: 80,
+  Numpad3: 81, Numpad0: 82, NumpadDecimal: 83, IntlBackslash: 86, F11: 87, F12: 88,
+  NumpadEnter: 96, ControlRight: 97, NumpadDivide: 98, PrintScreen: 99, AltRight: 100,
+  Home: 102, ArrowUp: 103, PageUp: 104, ArrowLeft: 105, ArrowRight: 106, End: 107,
+  ArrowDown: 108, PageDown: 109, Insert: 110, Delete: 111, Pause: 119, MetaLeft: 125,
+  MetaRight: 126, ContextMenu: 127,
+};
+
+let pc = null;
+let channel = null;
+const held = new Set();
+
+function send(bytes) {
+  if (channel && channel.readyState === 'open') channel.send(bytes);
+}
+
+function key(code, down) {
+  const k = KEYCODES[code];
+  if (k === undefined) return;
+  if (down) held.add(code); else held.delete(code);
+  const b = new Uint8Array(4);
+  b[0] = INPUT_KEY; b[1] = down ? 1 : 0; b[2] = k & 0xff; b[3] = k >> 8;
+  send(b);
+}
+
+function i16(v) { return Math.max(-32768, Math.min(32767, Math.round(v))); }
+
+function pair(type, x, y) {
+  const b = new ArrayBuffer(5), v = new DataView(b);
+  v.setUint8(0, type); v.setInt16(1, i16(x), true); v.setInt16(3, i16(y), true);
+  send(b);
+}
+
+// A key held when focus leaves would stay down in the game for good.
+function releaseAll() {
+  for (const code of [...held]) key(code, false);
+}
+
+// ── Cursor ────────────────────────────────────────────────────────────────
+// The game's own frames carry no cursor; the box says where it is and what
+// it looks like, and it is drawn here, over the picture.
+const pointer = { x: 0, y: 0, visible: false, image: null, hx: 0, hy: 0 };
+
+function onCursor(data) {
+  const v = new DataView(data);
+  if (v.byteLength < 1) return;
+  const kind = v.getUint8(0);
+  if (kind === CURSOR_UPDATE && v.byteLength >= 10) {
+    pointer.x = v.getFloat32(1, true); pointer.y = v.getFloat32(5, true);
+    pointer.visible = v.getUint8(9) !== CURSOR_HIDDEN;
+  } else if (kind === CURSOR_IMAGE && v.byteLength >= 21) {
+    pointer.x = v.getFloat32(1, true); pointer.y = v.getFloat32(5, true);
+    const w = v.getUint16(9, true), h = v.getUint16(11, true);
+    pointer.hx = v.getUint16(13, true); pointer.hy = v.getUint16(15, true);
+    const len = v.getUint32(17, true);
+    if (w && h && len === w * h * 4 && v.byteLength >= 21 + len) {
+      const pixels = new Uint8ClampedArray(data, 21, len);
+      createImageBitmap(new ImageData(new Uint8ClampedArray(pixels), w, h))
+        .then(img => { pointer.image = img; });
+    }
+    pointer.visible = true;
+  }
+}
+
+function drawCursor() {
+  const r = canvas.getBoundingClientRect();
+  const dpr = devicePixelRatio || 1;
+  if (canvas.width !== Math.round(r.width * dpr)) canvas.width = Math.round(r.width * dpr);
+  if (canvas.height !== Math.round(r.height * dpr)) canvas.height = Math.round(r.height * dpr);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (pointer.visible && vw && vh) {
+    // Where the picture sits inside the element, letterboxed.
+    const scale = Math.min(canvas.width / vw, canvas.height / vh);
+    const ox = (canvas.width - vw * scale) / 2, oy = (canvas.height - vh * scale) / 2;
+    const x = ox + pointer.x * scale, y = oy + pointer.y * scale;
+    if (pointer.image) {
+      ctx.drawImage(pointer.image, x - pointer.hx * scale, y - pointer.hy * scale,
+                    pointer.image.width * scale, pointer.image.height * scale);
+    } else {
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1.5 * dpr;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 18 * dpr);
+      ctx.lineTo(x + 5 * dpr, y + 13 * dpr); ctx.lineTo(x + 12 * dpr, y + 13 * dpr);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+  }
+  requestAnimationFrame(drawCursor);
+}
+requestAnimationFrame(drawCursor);
+
+// ── Connection ────────────────────────────────────────────────────────────
+async function connect() {
+  pc = new RTCPeerConnection();
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+  channel = pc.createDataChannel('input', { ordered: true });
+  channel.binaryType = 'arraybuffer';
+  channel.onmessage = e => onCursor(e.data);
+
+  const stream = new MediaStream();
+  pc.ontrack = e => {
+    stream.addTrack(e.track);
+    video.srcObject = stream;
+    // As little buffering as the browser allows: this is a game, not a film.
+    if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+    if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0;
+  };
+  pc.onconnectionstatechange = () => {
+    status.connection = pc.connectionState;
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') releaseAll();
+  };
+
+  const offer = await pc.createOffer();
+  // Ask for the stereo the box sends; without it the browser plays mono.
+  offer.sdp = offer.sdp.replace(/useinbandfec=1/g, 'useinbandfec=1;stereo=1');
+  await pc.setLocalDescription(offer);
+  const res = await fetch('offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/sdp', 'Authorization': 'Bearer ' + token },
+    body: pc.localDescription.sdp,
+  });
+  if (!res.ok) throw new Error(`offer refused: ${res.status} ${await res.text()}`);
+  await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() });
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────
+const locked = () => document.pointerLockElement === canvas.parentElement;
+
+start.addEventListener('click', async () => {
+  video.muted = false;
+  video.play().catch(() => {});
+  try { await canvas.parentElement.requestPointerLock({ unadjustedMovement: true }); }
+  catch { canvas.parentElement.requestPointerLock(); }
+});
+document.addEventListener('pointerlockchange', () => {
+  start.style.display = locked() ? 'none' : 'grid';
+  if (!locked()) releaseAll();
+});
+window.addEventListener('blur', releaseAll);
+// Said, rather than left for the hub to notice when the packets stop.
+// Closing the channel is what the hub hears; closing the connection alone is
+// noticed only when its checks time out.
+window.addEventListener('pagehide', () => {
+  releaseAll();
+  if (channel) channel.close();
+  if (pc) pc.close();
+});
+
+document.addEventListener('keydown', e => {
+  if (!locked()) return;
+  e.preventDefault();
+  if (!e.repeat) key(e.code, true);
+});
+document.addEventListener('keyup', e => {
+  if (!locked()) return;
+  e.preventDefault();
+  key(e.code, false);
+});
+document.addEventListener('mousemove', e => {
+  if (locked() && (e.movementX || e.movementY)) pair(INPUT_MOUSE_MOVE, e.movementX, e.movementY);
+});
+for (const [type, down] of [['mousedown', 1], ['mouseup', 0]]) {
+  document.addEventListener(type, e => {
+    if (!locked() || e.button > 2) return;
+    send(new Uint8Array([INPUT_MOUSE_BUTTON, e.button, down]));
+  });
+}
+document.addEventListener('wheel', e => {
+  if (!locked()) return;
+  e.preventDefault();
+  // One wheel notch is 15 on the compositor's axis; a browser reports it as
+  // about 100 pixels, or 3 lines.
+  const perUnit = e.deltaMode === 1 ? 5 : e.deltaMode === 2 ? 15 : 0.15;
+  pair(INPUT_MOUSE_WHEEL, e.deltaX * perUnit, e.deltaY * perUnit);
+}, { passive: false });
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+document.getElementById('full').addEventListener('click', async () => {
+  await document.documentElement.requestFullscreen().catch(() => {});
+  // Where allowed, keys like Esc reach the game instead of leaving fullscreen.
+  if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+});
+
+// ── What the connection is doing ──────────────────────────────────────────
+const status = { connection: 'connecting', error: '' };
+let last = null;
+
+async function sample() {
+  if (!pc) return;
+  const report = await pc.getStats();
+  const now = { t: performance.now() };
+  report.forEach(s => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') now.video = s;
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') now.audio = s;
+    if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') now.pair = s;
+  });
+  const v = now.video;
+  const out = { connection: status.connection };
+  if (v) {
+    const codec = v.codecId && report.get(v.codecId);
+    out.codec = codec ? codec.mimeType.replace('video/', '') : '?';
+    out.size = v.frameWidth ? `${v.frameWidth}x${v.frameHeight}` : '-';
+    out.fps = v.framesPerSecond || 0;
+    out.framesDecoded = v.framesDecoded || 0;
+    out.mbps = last && last.video
+      ? ((v.bytesReceived - last.video.bytesReceived) * 8 / ((now.t - last.t) * 1000)) : 0;
+    out.jitterBufferMs = v.jitterBufferEmittedCount
+      ? 1000 * v.jitterBufferDelay / v.jitterBufferEmittedCount : 0;
+    out.decodeMs = v.framesDecoded ? 1000 * v.totalDecodeTime / v.framesDecoded : 0;
+    out.packetsLost = v.packetsLost || 0;
+    out.freezes = v.freezeCount || 0;
+  }
+  if (now.audio) out.audioPackets = now.audio.packetsReceived || 0;
+  if (now.pair && now.pair.currentRoundTripTime !== undefined) {
+    out.rttMs = 1000 * now.pair.currentRoundTripTime;
+  }
+  last = now;
+  window.playerStats = out;
+  hud.textContent = status.error ? `error: ${status.error}` : [
+    `${out.connection}  ${out.codec || ''} ${out.size || ''}`,
+    `${(out.fps || 0).toFixed(0)} fps   ${(out.mbps || 0).toFixed(1)} Mbps`,
+    `network round trip ${out.rttMs !== undefined ? out.rttMs.toFixed(0) + ' ms' : '-'}`,
+    `jitter buffer ${(out.jitterBufferMs || 0).toFixed(0)} ms   decode ${(out.decodeMs || 0).toFixed(1)} ms`,
+    `lost ${out.packetsLost || 0} packets   ${out.freezes || 0} freezes`,
+  ].join('\n');
+}
+setInterval(() => sample().catch(() => {}), 1000);
+
+connect().catch(e => { status.error = e.message; hud.textContent = `error: ${e.message}`; });
+</script>
+</body>
+</html>

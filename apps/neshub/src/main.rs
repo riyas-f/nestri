@@ -14,8 +14,9 @@ mod ticket;
 mod windows;
 mod capture_cmd;
 mod pauses;
+mod webrtc;
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -129,6 +130,67 @@ struct Args {
         default_value = "/tmp/nestri-screenshot.sock"
     )]
     screenshot_ipc: PathBuf,
+
+    /// Serve browsers over WebRTC too: the player page and the route a
+    /// browser posts its offer to listen on this TCP address. Unset leaves
+    /// WebRTC off.
+    #[arg(long, env = "NESTRI_WEBRTC_HTTP")]
+    webrtc_http: Option<SocketAddr>,
+
+    /// The UDP port every browser's media uses.
+    #[arg(long, env = "NESTRI_WEBRTC_UDP_PORT", default_value_t = 8443)]
+    webrtc_udp_port: u16,
+
+    /// The IP address browsers are told to send media to.
+    ///
+    /// Behind a port forward -- a container on a rented GPU machine, say --
+    /// this is the machine's public address, which nothing inside can see.
+    /// Unset: this machine's own address on its default route.
+    #[arg(long, env = "NESTRI_WEBRTC_PUBLIC_IP")]
+    webrtc_public_ip: Option<IpAddr>,
+
+    /// The public port that reaches the UDP port, when the forward changes it.
+    #[arg(long, env = "NESTRI_WEBRTC_PUBLIC_PORT")]
+    webrtc_public_port: Option<u16>,
+
+    /// What a browser has to present to start a session. Unset: a random one,
+    /// written to the log with the player's address.
+    #[arg(long, env = "NESTRI_WEBRTC_TOKEN")]
+    webrtc_token: Option<String>,
+
+    /// Video codecs offered to browsers, most preferred first: h264, h265, av1.
+    ///
+    /// H.264 alone by default, because every browser decodes it in hardware.
+    #[arg(
+        long,
+        env = "NESTRI_WEBRTC_CODECS",
+        default_value = "h264",
+        value_delimiter = ','
+    )]
+    webrtc_codecs: Vec<String>,
+}
+
+/// This machine's address on its default route: the one a browser elsewhere
+/// on the same network would reach it at.
+///
+/// Connecting a UDP socket sends nothing; it only asks the kernel which
+/// interface it would use.
+fn default_route_ip() -> IpAddr {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("192.0.2.1:9")?;
+            s.local_addr()
+        })
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+/// 128 random bits, as hex.
+fn random_token() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// What to assume when nobody said.
@@ -559,6 +621,46 @@ async fn main() -> Result<()> {
         let gamepad_ipc = args.gamepad_ipc.clone();
         async move { ipc_listener::run_gamepad_ipc_listener(gamepad_ipc, mgr).await }
     });
+
+    if let Some(http) = args.webrtc_http {
+        let codecs = args
+            .webrtc_codecs
+            .iter()
+            .map(|name| {
+                webrtc::codec_named(name)
+                    .ok_or_else(|| anyhow::anyhow!("unknown WebRTC codec {name:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let token = match args.webrtc_token.clone() {
+            Some(token) if !token.is_empty() => token,
+            _ => random_token()?,
+        };
+        let ip = args.webrtc_public_ip.unwrap_or_else(default_route_ip);
+        let port = args.webrtc_public_port.unwrap_or(args.webrtc_udp_port);
+        let cfg = webrtc::Config {
+            http,
+            udp: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.webrtc_udp_port),
+            advertise: SocketAddr::new(ip, port),
+            token: token.clone(),
+            codecs,
+            ceiling_kbps: box_ceiling_kbps,
+        };
+        tracing::info!(
+            "browsers: open http://<this machine's address>:{}/?token={token}",
+            http.port()
+        );
+        let (mgr, input_tx, cmd_tx, controller) = (
+            session_manager.clone(),
+            input_broadcast_tx.clone(),
+            cmd_tx.clone(),
+            controller.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = webrtc::run(cfg, mgr, input_tx, cmd_tx, controller).await {
+                tracing::error!("WebRTC stopped: {e:#}");
+            }
+        });
+    }
 
     let ticket_ipc = args.ticket_ipc.clone();
     tokio::spawn({

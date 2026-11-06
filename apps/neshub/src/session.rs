@@ -650,7 +650,7 @@ async fn run_framed_reader<F, Fut>(
 /// batch is built by one sender in one write; if it does not parse, the
 /// disagreement is about the format and skipping ahead would only invent
 /// events nobody sent.
-fn split_input_events(payload: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn split_input_events(payload: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut offset = 0usize;
     while offset < payload.len() {
@@ -1256,6 +1256,12 @@ pub struct SessionManager {
     pauses: Arc<std::sync::Mutex<crate::pauses::PauseBook>>,
     /// Where commands for the encoders go; set by `serve_subscriptions`.
     cmd_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// The primary picture, its audio and its cursor, for browsers.
+    ///
+    /// A browser is shown what a client that never subscribed is shown, so it
+    /// is fed from the same decisions rather than a second copy of them. Sent
+    /// only while a browser is listening.
+    web_tap: tokio::sync::broadcast::Sender<crate::webrtc::Tap>,
 }
 
 impl SessionManager {
@@ -1286,7 +1292,37 @@ impl SessionManager {
             pyrowave_kbps,
             negotiator: Arc::new(Negotiator::new()),
             pauses: Default::default(),
+            web_tap: tokio::sync::broadcast::channel(256).0,
         }
+    }
+
+    /// The primary picture, audio and cursor, as they are broadcast.
+    pub fn web_tap(&self) -> tokio::sync::broadcast::Receiver<crate::webrtc::Tap> {
+        self.web_tap.subscribe()
+    }
+
+    /// A tag of its own for one viewer's input, from the same sequence the
+    /// native clients' gamepad sessions come from, so no two viewers share one.
+    pub fn input_session(&self) -> u32 {
+        self.next_gamepad_session.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The window of the primary picture: where input from a viewer that never
+    /// subscribed goes.
+    pub fn primary_window(&self) -> WindowId {
+        self.primary_window.load(Ordering::Relaxed) as WindowId
+    }
+
+    /// The encoder of the primary picture, once one has drawn.
+    pub fn primary_encoder(&self) -> Option<u32> {
+        match self.primary_pid.load(Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
+    pub fn negotiator(&self) -> Arc<Negotiator> {
+        self.negotiator.clone()
     }
 
     /// A session's pause handle, for tests.
@@ -1374,7 +1410,7 @@ impl SessionManager {
         cmd_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     ) {
         if self.drop_session(id).await {
-            self.negotiator.forget(id);
+            self.negotiator.forget(*id);
             self.negotiator.settle(controller, cmd_tx).await;
         }
     }
@@ -1490,6 +1526,16 @@ impl SessionManager {
             (window, note)
         };
         let data = Bytes::from(data);
+        if self.web_tap.receiver_count() > 0 {
+            if note.switched
+                && let Some(tx) = self.cmd_tx.get()
+            {
+                let _ = tx.send(keyframe_request(source));
+            }
+            if route(Subscription::Legacy, window, note.primary).is_some() {
+                let _ = self.web_tap.send(crate::webrtc::Tap::Video(data.clone()));
+            }
+        }
         let sessions = self.sessions.lock().await;
         if note.switched {
             // Clients that never subscribed are now shown another encoder:
@@ -1734,6 +1780,9 @@ impl SessionManager {
         self.audio_bytes
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         let data = Bytes::from(data);
+        if self.web_tap.receiver_count() > 0 {
+            let _ = self.web_tap.send(crate::webrtc::Tap::Audio(data.clone()));
+        }
         let sessions = self.sessions.lock().await;
         for session in sessions.values() {
             session.send_audio_packet(data.clone());
@@ -1741,6 +1790,11 @@ impl SessionManager {
     }
 
     pub async fn broadcast_cursor(&self, data: Vec<u8>) {
+        if self.web_tap.receiver_count() > 0 {
+            let _ = self
+                .web_tap
+                .send(crate::webrtc::Tap::Cursor(Bytes::from(data.clone())));
+        }
         let sessions = self.sessions.lock().await;
         if sessions.is_empty() {
             return;

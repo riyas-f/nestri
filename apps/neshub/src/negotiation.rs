@@ -93,9 +93,27 @@ pub fn effective_caps(caps: ClientCaps, pyrowave_format: Option<u8>) -> ClientCa
 /// The shared [`Agreement`] for this hub's clients, and the one way of acting
 /// on it.
 pub struct Negotiator {
-    agreement: std::sync::Mutex<Agreement<iroh::EndpointId>>,
+    agreement: std::sync::Mutex<Agreement<Viewer>>,
     /// When the encoder was last told the set again; see [`Self::reassert`].
     reasserted: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// Anyone the encoder's output is sent to.
+///
+/// Browsers watch over WebRTC and have no iroh endpoint id, but they decode
+/// the same single stream, so they belong in the same agreement: a browser
+/// that only takes H.264 has to hold the room to H.264 just as a native client
+/// would.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Viewer {
+    Native(iroh::EndpointId),
+    Browser(u64),
+}
+
+impl From<iroh::EndpointId> for Viewer {
+    fn from(id: iroh::EndpointId) -> Self {
+        Self::Native(id)
+    }
 }
 
 impl Negotiator {
@@ -106,12 +124,12 @@ impl Negotiator {
         }
     }
 
-    pub fn state(&self, client: iroh::EndpointId, caps: ClientCaps) {
-        self.agreement.lock().unwrap().state(client, caps);
+    pub fn state(&self, client: impl Into<Viewer>, caps: ClientCaps) {
+        self.agreement.lock().unwrap().state(client.into(), caps);
     }
 
-    pub fn forget(&self, client: &iroh::EndpointId) {
-        self.agreement.lock().unwrap().forget(client);
+    pub fn forget(&self, client: impl Into<Viewer>) {
+        self.agreement.lock().unwrap().forget(&client.into());
     }
 
     /// Give the encoder the joint set if it has changed since it was last
